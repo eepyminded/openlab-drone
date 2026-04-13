@@ -1,4 +1,4 @@
-26825253795487219
+26827029909381943
 Audio_Module
 Reverb_BTDR-1H
 Digital Reverberation Unit, http://www.belton.co.kr/inc/downfile.php?seq=17&file=pdf (footprint from http://www.uk-electronic.de/PDF/BTDR-1.pdf)
@@ -106364,6 +106364,13 @@ Varistor VF
 0
 2
 2
+jst
+JST_PH_S2B-PH-SM4-TB_1x02-1MP_P2.00mm_Horizontal_footprint
+JST PH series connector, S2B-PH-SM4-TB (http://www.jst-mfg.com/product/pdf/eng/ePH.pdf), generated with kicad-footprint-generator
+connector JST PH horizontal
+0
+4
+3
 libraries
 XIAO Landing page
 
