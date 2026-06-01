@@ -1,0 +1,1 @@
+change your gecko libraries to this edited ones, it allows for more than 3 pwm signals at once. Original code was using only timer0, this one is using timer0 and timer1, allowing for up to 6 pwm signals at once
