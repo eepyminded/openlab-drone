@@ -1,252 +1,277 @@
-#include <Arduino.h>
-#include <LSM6DS3.h>
-#include <Wire.h>
+#include <Arduino.h> 
+#include <LSM6DS3.h> 
+#include <Wire.h> 
 
-/* ===== CONFIGURATION ===== */
-#define MOTOR1_PIN D6   
-#define MOTOR2_PIN D9   
-#define MOTOR3_PIN D10  
-#define MOTOR4_PIN D0   
+/* ===== KONFIGURACJA ===== */ 
+#define MOTOR_FL_PIN D0    
+#define MOTOR_FR_PIN D10   
+#define MOTOR_BR_PIN D9    
+#define MOTOR_BL_PIN D6    
 
-#define PWM_RESOLUTION 10
-#define PWM_MAX 1023
+#define PWM_RESOLUTION 10 
+#define PWM_MAX 1023 
 
-// Flight Timing
-#define PREFLIGHT_DELAY_MS 10000 
-#define RAMP_UP_DURATION_MS 3000   
-#define HOVER_DURATION_MS 20000   
-#define LANDING_DURATION_MS 5000  
+// Timery
+#define LOOP_TIME_MS 4            // petla 250Hz
+#define PRE_CALIB_WAIT_SEC 10     // czas na odpiecie kabla
+#define ARMING_COOLDOWN_SEC 5     // opoznienie przed startem
+#define FLIGHT_TIME_MS 20000      // max czas lotu (20s)
 
-// GENTLE PID Gains to prevent "pirouettes" and over-correction
-float Kp_pitch = 0.4, Ki_pitch = 0.001, Kd_pitch = 0.08;
-float Kp_roll  = 0.4, Ki_roll  = 0.001, Kd_roll  = 0.08;
+/* ===== PID (KASKADA) ===== */ 
+// Zewn: kat -> predkosc (deg/s) 
+float Kp_angle = 1.5; // 0.0 na pierwszy test, najpierw tune rate
 
-#define PID_LIMIT 150 
+// Wewn: predkosc -> silniki 
+float Kp_rate = 0.3;   
+float Ki_rate = 0.04;  
+float Kd_rate = 0.05;  
 
-// Increased throttle to break ground effect (approx 44%)
-int target_hover_throttle = 450; 
+// Yaw 
+float Kp_yaw = 1.5; 
 
-// TRIM
-float pitch_trim = -10.0; // Negative = Tilt Backwards (fixing forward drift cuz battery is unleveled)
-float roll_trim  = 0.0;  // Adjust if drifting left/right
+#define RATE_LIMIT 150.0  
+#define PID_LIMIT 300  
+#define TILT_LIMIT 45.0 // max odchylenie
 
-// Tilt Safety Limit (degrees)
-#define TILT_LIMIT 75.0
+/* ===== STAN ===== */ 
+LSM6DS3 myIMU(I2C_MODE, 0x6A);  
+bool emergency_stop = false; 
+bool flight_completed = false; 
 
-/* ===== STATE VARIABLES ===== */
-LSM6DS3 myIMU(I2C_MODE, 0x6A); 
-bool flight_completed = false;
-bool emergency_stop = false;
-unsigned long flight_start_time = 0;
+unsigned long flight_start_time = 0; 
+unsigned long last_loop_time = 0; 
+unsigned long last_print_time = 0;
 
-// PID Variables
-float pitch_error_int = 0, roll_error_int = 0;
-float last_pitch_error = 0, last_roll_error = 0;
-bool first_loop = true;
+// Kat z filtra
+float angle_pitch = 0, angle_roll = 0; 
 
-// Calibration Offsets
-float gyroX_offset = 0, gyroY_offset = 0, gyroZ_offset = 0;
-float pitch_offset = 0, roll_offset = 0;
+// Pamiec PID
+float pitch_rate_int = 0, roll_rate_int = 0; 
+float last_pitch_rate_error = 0, last_roll_rate_error = 0; 
+float last_pitch_d = 0, last_roll_d = 0; 
 
-// FILTER VARIABLES (EMA Filter)
-float filterAlpha = 0.12; // Increased smoothing
-float smoothGyroX = 0, smoothGyroY = 0;
-float smoothPitch = 0, smoothRoll = 0;
+// Kalibracja 
+float gyroX_offset = 0, gyroY_offset = 0, gyroZ_offset = 0; 
 
-void setMotors(int m1, int m2, int m3, int m4) {
-  if (emergency_stop) {
-    analogWrite(MOTOR1_PIN, 0);
-    analogWrite(MOTOR2_PIN, 0);
-    analogWrite(MOTOR3_PIN, 0);
-    analogWrite(MOTOR4_PIN, 0);
-    return;
-  }
-  analogWrite(MOTOR1_PIN, constrain(m1, 0, PWM_MAX));
-  analogWrite(MOTOR2_PIN, constrain(m2, 0, PWM_MAX));
-  analogWrite(MOTOR3_PIN, constrain(m3, 0, PWM_MAX));
-  analogWrite(MOTOR4_PIN, constrain(m4, 0, PWM_MAX));
-}
+// Gaz reczny
+int manual_throttle = 120;
 
-void calibrateIMU() {
-  Serial.println("IMU Calibrating... KEEP LEVEL AND STILL.");
-  float sx = 0, sy = 0, sz = 0;
-  for (int i = 0; i < 200; i++) {
-    sx += myIMU.readFloatGyroX();
-    sy += myIMU.readFloatGyroY();
-    sz += myIMU.readFloatGyroZ();
-    delay(10);
-  }
-  gyroX_offset = sx / 200.0;
-  gyroY_offset = sy / 200.0;
-  gyroZ_offset = sz / 200.0;
+
+/* ===== FUNKCJE ===== */
+
+void setMotors(int fl, int fr, int br, int bl) { 
+  if (emergency_stop || flight_completed) { 
+    analogWrite(MOTOR_FL_PIN, 0); 
+    analogWrite(MOTOR_FR_PIN, 0); 
+    analogWrite(MOTOR_BR_PIN, 0); 
+    analogWrite(MOTOR_BL_PIN, 0); 
+    return; 
+  } 
+  analogWrite(MOTOR_FL_PIN, constrain(fl, 0, PWM_MAX)); 
+  analogWrite(MOTOR_FR_PIN, constrain(fr, 0, PWM_MAX)); 
+  analogWrite(MOTOR_BR_PIN, constrain(br, 0, PWM_MAX)); 
+  analogWrite(MOTOR_BL_PIN, constrain(bl, 0, PWM_MAX)); 
+} 
+
+void calibrateIMU() { 
+  Serial.println("\n--- KALIBRACJA IMU ---"); 
+  Serial.println("NIE DOTYKAJ DRONA!"); 
+  float sx = 0, sy = 0, sz = 0; 
   
-  // Initialize filters
-  smoothGyroX = 0;
-  smoothGyroY = 0;
-  smoothPitch = 0;
-  smoothRoll = 0;
-  Serial.println("Calibration Done.");
-}
-
-void setup() {
-  Serial.begin(115200);
+  // Probkowanie tla
+  for (int i = 0; i < 500; i++) { 
+    sx += myIMU.readFloatGyroX(); 
+    sy += myIMU.readFloatGyroY(); 
+    sz += myIMU.readFloatGyroZ(); 
+    delay(2); 
+  } 
+  gyroX_offset = sx / 500.0; 
+  gyroY_offset = sy / 500.0; 
+  gyroZ_offset = sz / 500.0; 
+   
+  // Inicjalizacja katow
+  float ax = myIMU.readFloatAccelX(); 
+  float ay = myIMU.readFloatAccelY(); 
+  float az = myIMU.readFloatAccelZ(); 
+  angle_pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI; 
+  angle_roll  = atan2(ay, az) * 180.0 / M_PI; 
   
-  pinMode(PD5, OUTPUT); 
-  digitalWrite(PD5, HIGH);
-  delay(500);
+  Serial.println("Kalibracja OK.\n"); 
+} 
 
-  if (myIMU.begin() != 0) {
-    while (1) { Serial.println("IMU Error!"); delay(1000); }
-  }
+void setup() { 
+  Serial.begin(115200); 
 
-  analogWriteResolution(PWM_RESOLUTION);
-  pinMode(MOTOR1_PIN, OUTPUT);
-  pinMode(MOTOR2_PIN, OUTPUT);
-  pinMode(MOTOR3_PIN, OUTPUT);
-  pinMode(MOTOR4_PIN, OUTPUT);
-  setMotors(0, 0, 0, 0);
+  pinMode(PD5, OUTPUT); digitalWrite(PD5, HIGH); delay(500); 
 
-  Serial.println("PRE-CALIBRATION: 5s to place drone LEVEL...");
-  delay(5000);
+  if (myIMU.begin() != 0) { 
+    while (1) { Serial.println("Blad IMU!"); delay(1000); } 
+  } 
 
-  calibrateIMU();
+  analogWriteResolution(PWM_RESOLUTION); 
+  pinMode(MOTOR_FL_PIN, OUTPUT); pinMode(MOTOR_FR_PIN, OUTPUT); 
+  pinMode(MOTOR_BR_PIN, OUTPUT); pinMode(MOTOR_BL_PIN, OUTPUT); 
+  setMotors(0, 0, 0, 0); 
 
-  Serial.println("\n--- TILT DETECTION TEST ---");
-  Serial.println("Sequence: 15s Wait -> 2s Ramp -> 10s Hover -> 3s Land");
-  
-  for(int i = 15; i > 0; i--) {
-    float ax = myIMU.readFloatAccelX();
-    float ay = myIMU.readFloatAccelY();
-    float az = myIMU.readFloatAccelZ();
-    float currentPitch = (atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI) - pitch_offset;
-    float currentRoll  = (atan2(ay, az) * 180.0 / M_PI) - roll_offset;
-
-    Serial.print("T-Minus: "); Serial.print(i); 
-    Serial.print("s | LIVE -> P: "); Serial.print(currentPitch, 1);
-    Serial.print(" R: "); Serial.println(currentRoll, 1);
+  // --- 1: START ---
+  Serial.println("=========================================");
+  Serial.println("ZASILANIE WLACZONE.");
+  Serial.print("MASZ "); Serial.print(PRE_CALIB_WAIT_SEC); Serial.println(" SEKUND NA ODLACZENIE USB");
+  Serial.println("I USTAWIENIE DRONA PLASKO.");
+  Serial.println("=========================================");
+  for (int i = PRE_CALIB_WAIT_SEC; i > 0; i--) {
+    Serial.print("Kalibracja za "); Serial.print(i); Serial.println("s...");
     delay(1000);
   }
 
-  Serial.println("!!! MOTOR START !!!");
-  flight_start_time = millis();
-}
-
-
-void loop() {
-  // --- RESET COMMAND ---
-  // sending r or R resets full thing
-  if (Serial.available()) {
-    char c = Serial.read();
-    if (c == 'r' || c == 'R') {
-      Serial.println("RESTARTING SYSTEM...");
-      delay(100);
-      NVIC_SystemReset(); // Software Reset for XIAO MG24
-    }
-    if (c == 's' || c == 'S') {
-      Serial.println("!!! MANUAL STOP TRIGGERED !!!");
-      emergency_stop = true;
-    }
+  // --- 2: KALIBRACJA ---
+  calibrateIMU(); 
+  
+  // --- 3: UZBROJENIE ---
+  Serial.println("=========================================");
+  Serial.println("KALIBRACJA OK. ZARAZ START.");
+  Serial.println("ODSUN SIE!");
+  Serial.println("=========================================");
+  for (int i = ARMING_COOLDOWN_SEC; i > 0; i--) {
+    Serial.print("Uzbrajanie za "); Serial.print(i); Serial.println("s...");
+    delay(1000);
   }
+  
+  Serial.println("\nGOTOWY DO LOTU.");
+  Serial.println("'w' - gaz +, 's' - gaz -, 'SPACJA' - stop.");
+   
+  flight_start_time = millis(); 
+  last_loop_time = micros(); 
+} 
 
-  if (flight_completed || emergency_stop) {
-    setMotors(0, 0, 0, 0);
-    if (emergency_stop) {
-      Serial.println("EMERGENCY STOP: TILT LIMIT EXCEEDED!");
-    }
-    return;
-  }
-
-  unsigned long current_time = millis();
-  unsigned long elapsed = current_time - flight_start_time;
-
-  // Read Sensors
-  float rawGyroPitch = myIMU.readFloatGyroX() - gyroX_offset; 
-  float rawGyroRoll  = myIMU.readFloatGyroY() - gyroY_offset; 
-  float ax = myIMU.readFloatAccelX();
-  float ay = myIMU.readFloatAccelY();
-  float az = myIMU.readFloatAccelZ();
-
-  // Calculate Tilt Angles (Accelerometer based) AND Subtract Offsets
-  float currentPitch = (atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI) - pitch_offset;
-  float currentRoll  = (atan2(ay, az) * 180.0 / M_PI) - roll_offset;
-
-  // Smooth data
-  smoothGyroX = (filterAlpha * rawGyroPitch) + ((1.0 - filterAlpha) * smoothGyroX);
-  smoothGyroY = (filterAlpha * rawGyroRoll) + ((1.0 - filterAlpha) * smoothGyroY);
-  smoothPitch = (filterAlpha * currentPitch) + ((1.0 - filterAlpha) * smoothPitch);
-  smoothRoll  = (filterAlpha * currentRoll) + ((1.0 - filterAlpha) * smoothRoll);
-
-  // Safety Check: Tilt Kill (Relative to our zeroed orientation)
-  if (abs(smoothPitch) > TILT_LIMIT || abs(smoothRoll) > TILT_LIMIT) {
-    emergency_stop = true;
-  }
-
-  if (elapsed < (RAMP_UP_DURATION_MS + HOVER_DURATION_MS)) {
-    // --- RAMP UP & HOVER ---
-    int current_base_throttle = target_hover_throttle;
-    if (elapsed < RAMP_UP_DURATION_MS) {
-      current_base_throttle = map(elapsed, 0, RAMP_UP_DURATION_MS, 0, target_hover_throttle);
-    }
-
-    // PID Calculation (Rate-based to dampen violent movements)
-    // INVERTED PITCH: smoothGyroX increases when forward, so we subtract it from trim
-    float pitch_error = pitch_trim - smoothGyroX; 
-    float roll_error  = roll_trim - smoothGyroY;
-
-    if (first_loop) {
-      last_pitch_error = pitch_error;
-      last_roll_error = roll_error;
-      first_loop = false;
-    }
-
-    pitch_error_int = constrain(pitch_error_int + pitch_error, -100, 100);
-    roll_error_int = constrain(roll_error_int + roll_error, -100, 100);
-
-    float pitch_output = (Kp_pitch * pitch_error) + (Ki_pitch * pitch_error_int) + (Kd_pitch * (pitch_error - last_pitch_error));
-    float roll_output  = (Kp_roll * roll_error) + (Ki_roll * roll_error_int) + (Kd_roll * (roll_error - last_roll_error));
-
-    last_pitch_error = pitch_error;
-    last_roll_error = roll_error;
-
-    pitch_output = constrain(pitch_output, -PID_LIMIT, PID_LIMIT);
-    roll_output  = constrain(roll_output, -PID_LIMIT, PID_LIMIT);
-
-    // 5. Motor Mixing (CUSTOM X-Configuration)
-    // Front: D0(FL), D10(FR) | Back: D6(BL), D9(BR)
-    // Left: D0(FL), D6(BL)  | Right: D10(FR), D9(BR)
-    int m_fl = current_base_throttle - pitch_output - roll_output; // D0
-    int m_fr = current_base_throttle - pitch_output + roll_output; // D10
-    int m_br = current_base_throttle + pitch_output + roll_output; // D9
-    int m_bl = current_base_throttle + pitch_output - roll_output; // D6
-
-    // Map to user-defined pins
-    analogWrite(MOTOR1_PIN, constrain(m_bl, 0, PWM_MAX)); // D6 is back-left
-    analogWrite(MOTOR2_PIN, constrain(m_br, 0, PWM_MAX)); // D9 is back-right
-    analogWrite(MOTOR3_PIN, constrain(m_fr, 0, PWM_MAX)); // D10 is front-right
-    analogWrite(MOTOR4_PIN, constrain(m_fl, 0, PWM_MAX)); // D0 is front-left
-
-    // Diagnostic Print
-    if (elapsed % 200 < 20) {
-      Serial.print("TILT -> P: "); Serial.print(smoothPitch, 1);
-      Serial.print(" R: "); Serial.print(smoothRoll, 1);
-      Serial.print(" | THR: "); Serial.println(current_base_throttle);
-    }
-
-  } else if (elapsed < (RAMP_UP_DURATION_MS + HOVER_DURATION_MS + LANDING_DURATION_MS)) {
-    // --- LANDING ---
-    unsigned long land_elapsed = elapsed - (RAMP_UP_DURATION_MS + HOVER_DURATION_MS);
-    float factor = 1.0 - ((float)land_elapsed / LANDING_DURATION_MS);
-    int land_throttle = target_hover_throttle * factor;
-    setMotors(land_throttle, land_throttle, land_throttle, land_throttle);
+void loop() { 
+  // --- RX SERIAL ---
+  if (Serial.available()) { 
+    char c = Serial.read(); 
     
-    if (elapsed % 500 < 20) Serial.println("LANDING...");
+    if (c == 'r' || c == 'R') NVIC_SystemReset(); 
+    
+    if (!flight_completed) {
+      if (c == ' ') { // kill switch
+        emergency_stop = true; 
+        manual_throttle = 0;
+        Serial.println("AWARYJNY STOP!");
+      }
+      if (c == 'w' || c == 'W') {
+        manual_throttle += 20; 
+        emergency_stop = false; 
+      }
+      if (c == 's' || c == 'S') manual_throttle -= 20;
+      
+      manual_throttle = constrain(manual_throttle, 0, PWM_MAX - PID_LIMIT);
+    }
+  } 
+
+  // --- BLOKADA SILNIKOW ---
+  if (flight_completed) {
+    setMotors(0, 0, 0, 0);
+    return; 
+  }
+
+  if (emergency_stop) { 
+    setMotors(0, 0, 0, 0); 
+    return; 
+  } 
+
+  // --- TIMEOUT LOTU ---
+  if (millis() - flight_start_time >= FLIGHT_TIME_MS) {
+    flight_completed = true;
+    manual_throttle = 0;
+    setMotors(0, 0, 0, 0);
+    Serial.println("\n=========================================");
+    Serial.println("LIMIT CZASU OSIAGNIETY.");
+    Serial.println("SILNIKI STOP.");
+    Serial.println("Wyslij 'r' lub reset zasilania.");
+    Serial.println("=========================================\n");
+    return; 
+  }
+
+  // --- SYNC PETLI ---
+  unsigned long current_micros = micros(); 
+  if (current_micros - last_loop_time < LOOP_TIME_MS * 1000) return; 
+  float dt = (current_micros - last_loop_time) / 1000000.0; 
+  last_loop_time = current_micros; 
+
+  // --- 1. IMU ---
+  float gx = myIMU.readFloatGyroX() - gyroX_offset; 
+  float gy = myIMU.readFloatGyroY() - gyroY_offset; 
+  float gz = myIMU.readFloatGyroZ() - gyroZ_offset; 
+  
+  float ax = myIMU.readFloatAccelX(); 
+  float ay = myIMU.readFloatAccelY(); 
+  float az = myIMU.readFloatAccelZ(); 
+
+  // --- 2. FILTR ---
+  float acc_pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI; 
+  float acc_roll  = atan2(ay, az) * 180.0 / M_PI; 
+  angle_pitch = 0.98 * (angle_pitch + gx * dt) + 0.02 * acc_pitch; 
+  angle_roll  = 0.98 * (angle_roll + gy * dt) + 0.02 * acc_roll; 
+
+  // Zabezpieczenie przed wywrotka
+  if (abs(angle_pitch) > TILT_LIMIT || abs(angle_roll) > TILT_LIMIT) {
+    emergency_stop = true; 
+    manual_throttle = 0;
+    Serial.println("KAT KRYTYCZNY - STOP");
+  }
+
+  // --- 3. PID ---
+  if (manual_throttle > 50) { 
+
+    float target_rate_pitch = constrain(Kp_angle * (0.0 - angle_pitch), -RATE_LIMIT, RATE_LIMIT); 
+    float target_rate_roll  = constrain(Kp_angle * (0.0 - angle_roll), -RATE_LIMIT, RATE_LIMIT); 
+    float target_rate_yaw   = 0.0; 
+
+    float pitch_rate_error = target_rate_pitch - gx; 
+    float roll_rate_error  = target_rate_roll - gy; 
+    float yaw_rate_error   = target_rate_yaw - gz; 
+
+    pitch_rate_int = constrain(pitch_rate_int + (pitch_rate_error * dt), -100, 100); 
+    roll_rate_int  = constrain(roll_rate_int + (roll_rate_error * dt), -100, 100); 
+
+    // LPF dla D
+    float current_pitch_d = (pitch_rate_error - last_pitch_rate_error) / dt;
+    float current_roll_d  = (roll_rate_error - last_roll_rate_error) / dt;
+    last_pitch_d = (0.7 * last_pitch_d) + (0.3 * current_pitch_d);
+    last_roll_d  = (0.7 * last_roll_d)  + (0.3 * current_roll_d);
+
+    float pitch_output = (Kp_rate * pitch_rate_error) + (Ki_rate * pitch_rate_int) + (Kd_rate * last_pitch_d); 
+    float roll_output  = (Kp_rate * roll_rate_error)  + (Ki_rate * roll_rate_int)  + (Kd_rate * last_roll_d); 
+    float yaw_output   = (Kp_yaw * yaw_rate_error); 
+
+    last_pitch_rate_error = pitch_rate_error; 
+    last_roll_rate_error = roll_rate_error; 
+
+    pitch_output = constrain(pitch_output, -PID_LIMIT, PID_LIMIT); 
+    roll_output  = constrain(roll_output, -PID_LIMIT, PID_LIMIT); 
+    yaw_output   = constrain(yaw_output, -PID_LIMIT, PID_LIMIT);
+
+    // --- 4. MIKSOWANIE ---
+    int m_fl = manual_throttle - pitch_output + roll_output + yaw_output;  
+    int m_fr = manual_throttle - pitch_output - roll_output - yaw_output;  
+    int m_br = manual_throttle + pitch_output - roll_output + yaw_output;  
+    int m_bl = manual_throttle + pitch_output + roll_output - yaw_output;  
+
+    setMotors(m_fl, m_fr, m_br, m_bl); 
     
   } else {
-    // --- FINISHED ---
     setMotors(0, 0, 0, 0);
-    flight_completed = true;
-    Serial.println("TEST COMPLETED. Disconnect battery to reset.");
+    pitch_rate_int = 0;
+    roll_rate_int = 0;
   }
 
-  delay(10); 
+  // --- 5. LOGI ---
+  if (millis() - last_print_time > 100) {
+    last_print_time = millis();
+    int time_left = (FLIGHT_TIME_MS - (millis() - flight_start_time)) / 1000;
+    
+    Serial.print("T-Minus: "); Serial.print(time_left); Serial.print("s");
+    Serial.print(" | THR: "); Serial.print(manual_throttle); 
+    Serial.print(" | AngP: "); Serial.print(angle_pitch, 1); 
+    Serial.print(" AngR: "); Serial.println(angle_roll, 1); 
+  }
 }
