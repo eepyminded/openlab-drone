@@ -1,6 +1,6 @@
 {
   "board": {
-    "active_layer": 2,
+    "active_layer": 0,
     "active_layer_preset": "",
     "auto_track_width": true,
     "hidden_netclasses": [],
@@ -21,7 +21,7 @@
       "footprints": true,
       "graphics": true,
       "keepouts": true,
-      "lockedItems": true,
+      "lockedItems": false,
       "otherItems": true,
       "pads": true,
       "text": true,
@@ -92,12 +92,12 @@
     "col_widths": [
       162,
       147,
-      102,
-      99,
-      106,
-      95,
-      99,
-      85,
+      91,
+      67,
+      91,
+      91,
+      91,
+      71,
       91,
       91
     ],
